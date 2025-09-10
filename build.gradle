@@ -1,0 +1,6 @@
+// root aggregator build file
+allprojects {
+    repositories {
+        mavenCentral()
+    }
+}

@@ -1,0 +1,118 @@
+networks:
+  notify-net:                        # Define a custom bridge network so containers can reach each other by name.
+
+volumes:
+  postgres_data:                     # Named volume to persist Postgres data across container restarts.
+
+services:
+  postgres:
+    image: postgres:14               # Official Postgres 14 image (multi-arch). Stable for local dev.
+    container_name: notification_postgres
+    environment:
+      POSTGRES_DB: notifications     # DB created on first run.
+      POSTGRES_USER: admin           # Admin user for local dev (don’t use in prod).
+      POSTGRES_PASSWORD: admin       # Password for that user (ditto).
+    ports:
+      - "5432:5432"                  # Expose Postgres to host at localhost:5432.
+    healthcheck:                     # Healthcheck gates dependent services.
+      test: ["CMD-SHELL", "pg_isready -U admin -d notifications"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # Persist DB files in a Docker volume.
+    networks: [notify-net]            # Attach to the shared network.
+
+  redis:
+    image: redis:7                    # Redis 7 (multi-arch). Used for idempotency/rate-limiting.
+    container_name: notification_redis
+    ports:
+      - "6379:6379"                   # Expose Redis to host at localhost:6379.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]  # Simple "PONG" health check.
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [notify-net]
+
+  zookeeper:
+    image: bitnami/zookeeper:3.9      # Zookeeper (Bitnami flavor). Needed by Kafka (ZooKeeper mode).
+    container_name: notification_zookeeper
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"    # Dev-friendly; no ACLs. Don’t use in prod.
+    ports:
+      - "2181:2181"                   # Expose ZooKeeper (useful for tools like Kafka UI).
+    networks: [notify-net]
+
+  kafka:
+    image: bitnami/kafka:3.7          # Kafka 3.7 (Bitnami). Good defaults, multi-arch, easy config via env vars.
+    container_name: notification_kafka
+    depends_on:
+      zookeeper:
+        condition: service_started    # Wait until ZK healthcheck passes before starting Kafka.
+    ports:
+      - "9092:9092"                    # Container/cluster internal listener (PLAINTEXT).
+      - "29092:29092"                  # Host-exposed listener for apps running on your laptop.
+    environment:
+      # Tell Kafka where ZooKeeper is.
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # Define two listeners:
+      #  - PLAINTEXT://:9092  binds inside container network
+      #  - EXTERNAL://:29092  binds to host port for local dev tools / host apps
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:29092
+
+      # How Kafka advertises itself to clients:
+      #  - containers should connect to 'kafka:9092'
+      #  - host machine clients should connect to 'localhost:29092'
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+
+      # Map listener names to protocols (both unencrypted/plaintext for dev).
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+
+      # Which listener brokers use to talk to each other (PLAINTEXT inside the Docker network).
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Dev-friendly broker settings:
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"         # Let Kafka create topics on first use (great for quick dev).
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"     # Single-broker dev cluster → RF must be 1.
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1" # Same rationale for transaction topics.
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"        # Minimum in-sync replicas for transaction topic (dev).
+      ALLOW_PLAINTEXT_LISTENER: "yes"                     # Bitnami guardrail: explicitly allow plaintext.
+
+    healthcheck:
+      # Ask broker for supported API versions; exit code 0 means broker is up.
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [notify-net]
+
+  # Optional but super useful UI to browse topics, messages, partitions, consumer groups.
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka_ui
+    depends_on:
+      kafka:
+        condition: service_healthy     # Start after Kafka is healthy.
+    ports:
+      - "8085:8080"                    # Access at http://localhost:8085
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092   # Connect inside the Docker network.
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks: [notify-net]
+
+  # Browser-based Postgres admin tool.
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com  # Initial login user for pgAdmin UI.
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"                             # Access at http://localhost:5050
+    networks: [notify-net]
